@@ -18,22 +18,19 @@ import pandas as pd
 import geopandas as gpd
 
 import scipy.ndimage as ndimage
-import scipy.ndimage.filters as filters
 from scipy.spatial.distance import cdist
 
-from skimage.morphology import watershed
+from skimage.segmentation import watershed
 from skimage.filters import threshold_otsu
-# from skimage.feature import peak_local_max
 
-import gdal
-import osr
+from osgeo import gdal, osr
 
 from shapely.geometry import mapping, Point, Polygon
 
 from rasterio.features import shapes as rioshapes
 
 import fiona
-from fiona.crs import from_epsg
+from pyproj import CRS
 
 import laspy
 
@@ -122,7 +119,7 @@ class PyCrown:
             raise IOError(e)
         proj = osr.SpatialReference(wkt=chm_gdal.GetProjection())
         self.epsg = int(proj.GetAttrValue('AUTHORITY', 1))
-        self.srs = from_epsg(self.epsg)
+        self.srs = CRS.from_epsg(self.epsg)
         self.geotransform = chm_gdal.GetGeoTransform()
         self.resolution = abs(self.geotransform[-1])
         self.ul_lon = chm_gdal.GetGeoTransform()[0]
@@ -187,14 +184,13 @@ class PyCrown:
         fname :   str
                   Path to LiDAR dataset (.las or .laz-file)
         """
-        las = laspy.file.File(str(fname), mode='r')
+        las = laspy.read(str(fname))
         lidar_points = np.array((
-            las.x, las.y, las.z, las.intensity, las.return_num,
+            las.x, las.y, las.z, las.intensity, las.return_number,
             las.classification
         )).transpose()
         colnames = ['x', 'y', 'z', 'intensity', 'return_num', 'classification']
         self.las = pd.DataFrame(lidar_points, columns=colnames)
-        las.close()
 
     def _check_empty(self):
         """ Helper function raising an Exception if no trees present
@@ -398,7 +394,7 @@ class PyCrown:
         ndarray
             smoothed raster
         """
-        return filters.median_filter(
+        return ndimage.median_filter(
             raster, footprint=self._get_kernel(ws, circular=circular))
 
     def clip_data_to_bbox(self, bbox, las_offset=10):
@@ -513,7 +509,7 @@ class PyCrown:
                 ws = int(ws / resolution)
 
         # Maximum filter to find local peaks
-        raster_maximum = filters.maximum_filter(
+        raster_maximum = ndimage.maximum_filter(
             raster, footprint=self._get_kernel(ws, circular=True))
         tree_maxima = raster == raster_maximum
 
@@ -548,7 +544,7 @@ class PyCrown:
         else:
             df = pd.DataFrame(np.array([trees, trees], dtype='object').T,
                               dtype='object', columns=['top_cor', 'top'])
-            self.trees = self.trees.append(df)
+            self.trees = pd.concat([self.trees, df], ignore_index=True)
 
         self._check_empty()
 
@@ -848,7 +844,7 @@ class PyCrown:
 
         print('Attach LiDAR points to corresponding crowns')
         lidar_in_crowns = gpd.sjoin(lidar_geodf, crown_geodf,
-                                    op='within', how="inner")
+                                     predicate='within', how="inner")
 
         lidar_tree_class = np.zeros(lidar_in_crowns['index_right'].size)
         lidar_tree_mask = np.zeros(lidar_in_crowns['index_right'].size,
@@ -863,7 +859,7 @@ class PyCrown:
             # check that not all values are the same
             if len(points.z) > 1 and not np.allclose(points.z,
                                                      points.iloc[0].z):
-                points = points[points.z >= threshold_otsu(points.z)]
+                points = points[points.z >= threshold_otsu(points.z.values)]
                 if first_return:
                     points = points[points.return_num == 1]  # first returns
             hull = points.unary_union.convex_hull
@@ -876,21 +872,19 @@ class PyCrown:
             print('Classifying point cloud')
             lidar_in_crowns = lidar_in_crowns[lidar_tree_mask]
             lidar_tree_class = lidar_tree_class[lidar_tree_mask]
-            header = laspy.header.Header()
             self.outpath.mkdir(parents=True, exist_ok=True)
-            outfile = laspy.file.File(
-                self.outpath / "trees.las", mode="w", header=header
-            )
             xmin = np.floor(np.min(lidar_in_crowns.x))
             ymin = np.floor(np.min(lidar_in_crowns.y))
             zmin = np.floor(np.min(lidar_in_crowns.z))
-            outfile.header.offset = [xmin, ymin, zmin]
-            outfile.header.scale = [0.001, 0.001, 0.001]
-            outfile.x = lidar_in_crowns.x
-            outfile.y = lidar_in_crowns.y
-            outfile.z = lidar_in_crowns.z
-            outfile.intensity = lidar_tree_class
-            outfile.close()
+            header = laspy.LasHeader(point_format=0)
+            header.offsets = [xmin, ymin, zmin]
+            header.scales = [0.001, 0.001, 0.001]
+            outfile = laspy.LasData(header)
+            outfile.x = lidar_in_crowns.x.values
+            outfile.y = lidar_in_crowns.y.values
+            outfile.z = lidar_in_crowns.z.values
+            outfile.intensity = lidar_tree_class.astype(np.uint16)
+            outfile.write(str(self.outpath / "trees.las"))
 
         self.lidar_in_crowns = lidar_in_crowns
 
@@ -933,8 +927,9 @@ class PyCrown:
             'geometry': '3D Point',
             'properties': {'DN': 'int', 'TH': 'float', 'COR': 'int'}
         }
-        with fiona.collection(
-            str(outfile), 'w', 'ESRI Shapefile', schema, crs=self.srs
+        with fiona.open(
+            str(outfile), 'w', 'ESRI Shapefile', schema,
+            crs=self.srs.to_wkt()
         ) as output:
             for tidx in range(len(self.trees)):
                 feat = {}
@@ -966,9 +961,9 @@ class PyCrown:
             'geometry': 'Polygon',
             'properties': {'DN': 'int', 'TTH': 'float', 'TCH': 'float'}
         }
-        with fiona.collection(
+        with fiona.open(
             str(outfile), 'w', 'ESRI Shapefile',
-            schema, crs=self.srs
+            schema, crs=self.srs.to_wkt()
         ) as output:
             for tidx in range(len(self.trees)):
                 feat = {}
@@ -1008,7 +1003,7 @@ class PyCrown:
         gdal_file.SetGeoTransform(
             (self.ul_lon, res, 0., self.ul_lat, 0., -res)
         )
-        dataset_srs = gdal.osr.SpatialReference()
+        dataset_srs = osr.SpatialReference()
         dataset_srs.ImportFromEPSG(self.epsg)
         gdal_file.SetProjection(dataset_srs.ExportToWkt())
         band = gdal_file.GetRasterBand(1)

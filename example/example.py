@@ -55,7 +55,7 @@ if __name__ == '__main__':
     PC.crowns_to_polys_smooth(store_las=True)
 
     # Check that all geometries are valid
-    PC.quality_control()
+    PC.quality_control(all_good=True)
 
     # Export results
     PC.export_raster(PC.chm, PC.outpath / 'chm.tif', 'CHM')
